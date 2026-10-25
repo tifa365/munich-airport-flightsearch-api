@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Flughafen München – Flugsuche (inoffizielle Web-API)
   version: "2026-10-25"
-  summary: Reverse-engineerte Beschreibung der AJAX-Endpunkte hinter der Flugsuche auf munich-airport.de / munich-airport.com.
+  summary: Inoffizielle Beschreibung der AJAX-Endpunkte hinter der Flugsuche auf munich-airport.de / munich-airport.com.
   description: |
     Die Website des Flughafens München (Rails-Anwendung "pinuts", hinter Citrix NetScaler) lädt Ankunfts-/Abflugtafeln,
     Autocomplete-Vorschläge, den persönlichen "Flug merken"-Tracker und Wetterinfos per AJAX nach.

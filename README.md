@@ -1,4 +1,4 @@
-# Flughafen München – Flugsuche-API (inoffiziell, reverse-engineert)
+# Flughafen München – Flugsuche-API (inoffiziell)
 
 Beschreibung der AJAX-Endpunkte hinter der Flugsuche auf <https://www.munich-airport.de/flugsuche-89523>
 (Rails-Anwendung „pinuts“). Die Spezifikation liegt in [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, validiert mit
