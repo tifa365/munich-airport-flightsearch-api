@@ -1,0 +1,799 @@
+openapi: 3.1.0
+info:
+  title: Flughafen München – Flugsuche (inoffizielle Web-API)
+  version: "2026-10-25"
+  summary: Reverse-engineerte Beschreibung der AJAX-Endpunkte hinter der Flugsuche auf munich-airport.de / munich-airport.com.
+  description: |
+    Die Website des Flughafens München (Rails-Anwendung "pinuts", hinter Citrix NetScaler) lädt Ankunfts-/Abflugtafeln,
+    Autocomplete-Vorschläge, den persönlichen "Flug merken"-Tracker und Wetterinfos per AJAX nach.
+    Diese Spezifikation beschreibt diese Endpunkte so, wie sie am **2026-10-25** live beobachtet wurden.
+
+    **Nicht offiziell.** Es gibt keine öffentliche Dokumentation, keinen Stabilitätsvertrag und keine Zusicherung,
+    dass sich HTML-Struktur oder Parameter nicht ändern. Nutzung nur im Rahmen der Nutzungsbedingungen des Betreibers.
+
+    ## Authentifizierung
+    Keine. Alle GET-Endpunkte antworten ohne Cookie, ohne `X-CSRF-Token` und ohne `X-Requested-With`.
+    Die vom Browser mitgeschickten Header sind für GET optional. `POST` auf dieselben Pfade liefert `403` (CSRF-Schutz).
+
+    ## Sprache (Locale)
+    Die Sprache der Antworten (Überschriften, Statustexte, Autocomplete-Bezeichnungen) hängt **nicht** vom
+    Query-Parameter `flight_search_presenter[locale]` ab (wird serverseitig ignoriert), sondern von der Rails-Session
+    im Cookie `_fmg-a1`. Die Session wird beim Aufruf einer beliebigen Seite auf dem jeweiligen Host gesetzt:
+    * `https://www.munich-airport.de/...` → Deutsch
+    * `https://www.munich-airport.com/...` → Englisch
+
+    Ohne Cookie antworten **beide** Hosts auf Deutsch. Für englische Antworten also zuerst z. B.
+    `GET https://www.munich-airport.com/all-departures-1450598` laden und den `_fmg-a1`-Cookie wiederverwenden
+    (das Cookie funktioniert dann auch auf dem .de-Host).
+
+    ## Antwortformat
+    Die Flugtafel-Endpunkte liefern **HTML-Fragmente** (kein JSON). Die Struktur ist unter `components/x-htmlFragments`
+    und in `README.md` beschrieben. Wichtigstes Detail: jeder Flug ist **doppelt** enthalten (Desktop-Tabelle
+    `fp-flights-table-large` und Mobil-Tabelle `fp-flights-table-small`); beim Parsen nach `data-flight-id` deduplizieren.
+
+    ## Zwei Abfragemodi der Flugtafeln
+    1. **Board-Modus** (Tabs "Ankunft"/"Abflug"): Parameter `from`, `min_date`, `max_date`, `allow_scroll_back`.
+       Blättert zeitlich ab dem Zeitpunkt `from`; `page` darf negativ sein (frühere Flüge), wenn `allow_scroll_back=1`.
+    2. **Such-Modus** (Tab "Flugsuche"): Parameter `flight_search_presenter[...]` (Datum, Zeitfenster, Flughafen,
+       Airline, Flugnummer). Ohne Datum wird der heutige Tag genommen.
+
+    Beide Modi lassen sich auf `/flightsearch/departures` und `/flightsearch/arrivals` kombinieren;
+    bei Abflügen zählen die `*_from_muc`-Felder, bei Ankünften die `*_to_muc`-Felder.
+
+    ## Bekannte Fehlerbilder (live beobachtet)
+    * Ungültiges `from`, `min_date`, `max_date` oder ein skalarer Wert für `flight_search_presenter` → `500` (HTML-Fehlerseite).
+    * `per_page=1000` im Board-Modus (`from=…` ohne `min_date`/`max_date`, ~53 000 Treffer) → `500`; `750` lieferte
+      noch `200` (3,3 MB). Im Such-Modus (Tagesabfrage, ~400 Treffer) funktionierte `per_page=1000` und lieferte alle
+      Flüge des Tages. Vermutlich Zeit-/Speicherlimit bei großen Ergebnismengen, keine feste Obergrenze. Klein halten.
+    * Datumsabfragen ab dem 27.10.2026 lieferten am Testtag durchgängig `500` (Ankunft und Abflug, Board- und Such-Modus),
+      obwohl der Datepicker bis 2027-03-28 erlaubt. 2027-03-28 selbst lieferte `200` mit 0 Treffern. Vermutlich
+      ein temporärer Datenstand-Effekt zum Winterflugplan-Wechsel (Saisonstart 25.10.2026); zur Laufzeit erneut prüfen.
+    * Ungültiges Datum im Such-Modus (`foo`) → kein Fehler, Rückfall auf heute. Unbekannte `airport_id` → 0 Treffer.
+    * Eine Web Application Firewall vor der Anwendung antwortet mit `403` und einer statischen Seite
+      "Request Rejected / Anfrage blockiert" auf auffällige URLs (Steuerzeichen, sehr lange Zahlen, unsinnige
+      Datumswerte wie `9549-20-43T59:03:66`, leere Parameternamen) sowie auf nicht erlaubte Methoden (`POST`, `TRACE`).
+      Es gibt also kein `405`. Gefunden per Schemathesis-Fuzzing (`fuzz-reports/SUMMARY.md`).
+  contact:
+    name: Flughafen München GmbH (Betreiber der Website, nicht Herausgeber dieser Spec)
+    url: https://www.munich-airport.de/
+  license:
+    name: Dokumentation CC0-1.0; die API selbst unterliegt den Nutzungsbedingungen von munich-airport.de
+    identifier: CC0-1.0
+security: []
+externalDocs:
+  description: Saison-Flugplan Winter 2026/2027 als PDF (Datenstand 23.10.2026; Quelle der Tabelle mit L/S, Flug-Nr, Verkehrstagen, Gültigkeit, Terminal)
+  url: https://www.munich-airport.de/_b/0000000000000027589260bb6718b5d0/flugplan.pdf
+
+servers:
+  - url: https://www.munich-airport.de
+    description: Deutsche Site (Standardsprache Deutsch)
+  - url: https://www.munich-airport.com
+    description: Englische Site (Englisch nur mit Session-Cookie, siehe oben)
+
+tags:
+  - name: Flugtafel
+    description: Ankunfts- und Abflugtafel sowie Flugsuche (HTML-Fragmente)
+  - name: Autocomplete
+    description: Vorschlagslisten für Flughafen- und Airline-Felder (JSON)
+  - name: Zusatz
+    description: Tracker-Slider, Wetter, Prozesszeiten, Detailseite
+  - name: Statisch
+    description: Statische Ressourcen (Flugplan-PDF)
+
+paths:
+  /flightsearch/departures:
+    get:
+      tags: [Flugtafel]
+      operationId: getDepartures
+      summary: Abflüge ab MUC (HTML-Fragment)
+      description: |
+        Liefert die Abflugtafel als HTML-Fragment. Siehe Beschreibung der beiden Modi oben.
+        Im Such-Modus werden ausschließlich die `*_from_muc`-Felder ausgewertet; `flight_from_muc`/`flight_to_muc`
+        sind reine Client-Flags (Server ignoriert sie, getestet mit `0` und `1`).
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/per_page'
+        - $ref: '#/components/parameters/allow_pagination'
+        - $ref: '#/components/parameters/from'
+        - $ref: '#/components/parameters/allow_scroll_back'
+        - $ref: '#/components/parameters/min_date'
+        - $ref: '#/components/parameters/max_date'
+        - $ref: '#/components/parameters/fsp_flight_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_date_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_time_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_to_muc'
+        - $ref: '#/components/parameters/fsp_flight_date_to_muc'
+        - $ref: '#/components/parameters/fsp_flight_time_to_muc'
+        - $ref: '#/components/parameters/fsp_airport'
+        - $ref: '#/components/parameters/fsp_airport_id'
+        - $ref: '#/components/parameters/fsp_airline'
+        - $ref: '#/components/parameters/fsp_airline_id'
+        - $ref: '#/components/parameters/fsp_flight_number'
+        - $ref: '#/components/parameters/fsp_locale'
+        - $ref: '#/components/parameters/fsp_perform_search'
+        - $ref: '#/components/parameters/utf8'
+        - $ref: '#/components/parameters/cacheBuster'
+      responses:
+        '200':
+          $ref: '#/components/responses/FlightBoardFragment'
+        '403':
+          $ref: '#/components/responses/WafRejected'
+        '500':
+          $ref: '#/components/responses/ServerErrorPage'
+  /flightsearch/arrivals:
+    get:
+      tags: [Flugtafel]
+      operationId: getArrivals
+      summary: Ankünfte in MUC (HTML-Fragment)
+      description: |
+        Wie `/flightsearch/departures`, aber für Ankünfte. Im Such-Modus zählen die `*_to_muc`-Felder.
+        Spaltenreihenfolge der großen Tabelle: Airline, Von, Flugnr. (Typ), Status, Abflug (am Startort),
+        MUC an (Geplant | Erwartet), Bereich, Flug merken, Flug buchen.
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/per_page'
+        - $ref: '#/components/parameters/allow_pagination'
+        - $ref: '#/components/parameters/from'
+        - $ref: '#/components/parameters/allow_scroll_back'
+        - $ref: '#/components/parameters/min_date'
+        - $ref: '#/components/parameters/max_date'
+        - $ref: '#/components/parameters/fsp_flight_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_date_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_time_from_muc'
+        - $ref: '#/components/parameters/fsp_flight_to_muc'
+        - $ref: '#/components/parameters/fsp_flight_date_to_muc'
+        - $ref: '#/components/parameters/fsp_flight_time_to_muc'
+        - $ref: '#/components/parameters/fsp_airport'
+        - $ref: '#/components/parameters/fsp_airport_id'
+        - $ref: '#/components/parameters/fsp_airline'
+        - $ref: '#/components/parameters/fsp_airline_id'
+        - $ref: '#/components/parameters/fsp_flight_number'
+        - $ref: '#/components/parameters/fsp_locale'
+        - $ref: '#/components/parameters/fsp_perform_search'
+        - $ref: '#/components/parameters/utf8'
+        - $ref: '#/components/parameters/cacheBuster'
+      responses:
+        '200':
+          $ref: '#/components/responses/FlightBoardFragment'
+        '403':
+          $ref: '#/components/responses/WafRejected'
+        '500':
+          $ref: '#/components/responses/ServerErrorPage'
+
+  /flightsearch/autocomplete_airport:
+    get:
+      tags: [Autocomplete]
+      operationId: autocompleteAirport
+      summary: Flughafen-/Länder-Vorschläge
+      description: |
+        Volltext-Vorschläge für das Feld "Flugziel, Code oder Land". Trifft auf Stadtname, Land und IATA-Code
+        (z. B. `Rom`, `FCO`). Länder erscheinen als Gruppe mit kommagetrennter `id`
+        (z. B. `"144,387,44188,661"` = Rumänien, alle Flughäfen); diese Gruppen-ID kann direkt als
+        `flight_search_presenter[airport_id]` verwendet werden. Leerer oder fehlender `search_term` → `[]`.
+      parameters:
+        - $ref: '#/components/parameters/search_term'
+      responses:
+        '200':
+          description: Trefferliste (ggf. leer)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AirportSuggestion'
+              examples:
+                rom:
+                  summary: search_term=Rom (deutsche Session)
+                  value:
+                    - { id: "144,387,44188,661", display_human: "Rumänien, Alle Flughäfen", type: airport, type_human: "Flüge von/nach:" }
+                    - { id: "1117", display_human: "Rom, Italien (FCO)", type: airport, type_human: "Flüge von/nach:" }
+                    - { id: "578", display_human: "Stuttgart, Deutschland (STR)", type: airport, type_human: "Flüge von/nach:" }
+                fco:
+                  summary: search_term=FCO
+                  value:
+                    - { id: "1117", display_human: "Rom, Italien (FCO)", type: airport, type_human: "Flüge von/nach:" }
+                leer:
+                  summary: kein Treffer
+                  value: []
+        '403':
+          $ref: '#/components/responses/WafRejected'
+  /flightsearch/autocomplete_airline:
+    get:
+      tags: [Autocomplete]
+      operationId: autocompleteAirline
+      summary: Airline-Vorschläge
+      description: Vorschläge für das Feld "Airline oder Code" (Name, IATA- oder ICAO-Code). `id` ist hier numerisch.
+      parameters:
+        - $ref: '#/components/parameters/search_term'
+      responses:
+        '200':
+          description: Trefferliste (ggf. leer)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AirlineSuggestion'
+              examples:
+                luft:
+                  summary: search_term=Luft
+                  value:
+                    - { id: 52, display_human: "Lufthansa (LH, DLH)", type: airline, type_human: "Flüge mit" }
+                    - { id: 6038, display_human: "Lufthansa Cargo (--, GEC)", type: airline, type_human: "Flüge mit" }
+                    - { id: 11034, display_human: "Lufthansa City Airlines (VL, LHX)", type: airline, type_human: "Flüge mit" }
+        '403':
+          $ref: '#/components/responses/WafRejected'
+
+  /flightsearch/tracker:
+    get:
+      tags: [Zusatz]
+      operationId: getTracker
+      summary: Slider "Flug merken" für gemerkte Flüge (HTML-Fragment)
+      description: |
+        Rendert für die übergebenen Flug-IDs (die der Browser in `localStorage` hält) einen Slider mit
+        Flugnummer, Status, Ziel/Herkunft und Countdown ("Abflug in"/"Abflug vor" `HH:MM`).
+        Ohne `flight_ids[]` ist die Antwort `200` mit **leerem Body**. Unbekannte IDs werden stillschweigend ausgelassen.
+        Die ID funktioniert mit und ohne `.0`-Suffix.
+      parameters:
+        - name: flight_ids[]
+          in: query
+          required: false
+          description: Eine oder mehrere Flug-IDs (`data-flight-id` aus der Flugtafel), wiederholter Parameter.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/FlightId'
+          example: ["10409942.0", "10407675.0"]
+        - $ref: '#/components/parameters/cacheBuster'
+      responses:
+        '200':
+          description: HTML-Fragment `div.flight-tracker` mit `li.slide-item` je Flug, oder leerer Body.
+          content:
+            text/html:
+              schema:
+                type: string
+              example: |
+                <div class="flight-tracker"><div class="flight-tracker-inner"><div id="flight-tracker-slider" class="flight-tracker-slider flexslider"><ul class="slides">
+                  <li class="slide-item" style="display: none;">
+                    <a class="link-block" href="/flugdetailseite-75020?flight_id=10409942.0">
+                      <div class="flight-tracker-item">
+                        <div class="flight-tracker-type" aria-label="Abflug">…</div>
+                        <div class="flight-tracker-details">
+                          <div class="flight-tracker-id">LH 1842</div>
+                          <div class="flight-tracker-status">geplant</div>
+                          <div class="flight-tracker-destination">Valencia</div>
+                        </div>
+                        <div class="flight-tracker-termination"><div class="flight-time-headline">Abflug in</div><time>04:32</time></div>
+                      </div>
+                    </a>
+                  </li>
+                </ul>…</div></div></div>
+        '403':
+          $ref: '#/components/responses/WafRejected'
+
+  /flightsearch/weather_info:
+    get:
+      tags: [Zusatz]
+      operationId: getWeatherInfo
+      summary: Wetter-Icon und Temperatur für einen Flughafen (HTML-Fragment)
+      description: |
+        Wird von der Flugdetailseite nachgeladen (`data-weather-url`). Liefert ein SVG-Icon (`icon-rain`,
+        `icon-clear-day`, …) und `span.flight-box-temperature` mit Temperatur in °C.
+        MUC hat die `airport_id` 473. Fehlt `time` oder `airport_id`, antwortet der Server mit `500`.
+        Beide Parameter werden kaum validiert: `airport_id=null` mit einem exotischen `time`-Wert lieferte `200`
+        mit leerem `span.flight-box-temperature` (Fuzzing-Befund). Parser müssen mit leerer Temperatur rechnen.
+      parameters:
+        - name: airport_id
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          example: 473
+        - name: time
+          in: query
+          required: true
+          description: Zeitpunkt in UTC (ISO 8601 mit `Z`), typischerweise die planmäßige Abflug-/Ankunftszeit.
+          schema:
+            type: string
+            format: date-time
+          example: "2026-10-25T14:10:00Z"
+      responses:
+        '200':
+          description: HTML-Fragment
+          content:
+            text/html:
+              schema:
+                type: string
+              example: |
+                <svg class="icon icon-rain" role="img" aria-hidden="true"><use xlink:href="#icon-rain" /></svg>
+                <span class="flight-box-temperature">12°C</span>
+        '403':
+          $ref: '#/components/responses/WafRejected'
+        '500':
+          $ref: '#/components/responses/ServerErrorPage'
+
+  /flightsearch/flight_process_time/{flight_id}:
+    get:
+      tags: [Zusatz]
+      operationId: getFlightProcessTime
+      summary: Prozesszeit (Puffer) für einen Flug – Erfolgsformat nicht verifiziert
+      description: |
+        Aus dem Client-JavaScript des "Mobility as a Service"-Widgets rekonstruiert
+        (`$.ajax({url: "/flightsearch/flight_process_time/" + id, data: {direction}})`).
+        Alle Live-Tests (mehrere aktuelle Abflüge/Ankünfte, alle vier `direction`-Werte) lieferten `404` mit
+        Klartext-Body `Process time not found: <id>, <direction>` und `Content-Type: application/json`.
+        Das Erfolgsformat ist daher **nicht bestätigt** (vermutlich JSON mit Minutenangabe).
+      parameters:
+        - name: flight_id
+          in: path
+          required: true
+          description: Numerische Flug-ID ohne `.0`-Suffix (der Client wendet `parseInt` an).
+          schema:
+            type: integer
+            minimum: 1
+          example: 10409942
+        - name: direction
+          in: query
+          required: false
+          description: Vom Client zusammengesetzt aus `from`/`to` + `Departure`/`Arrival`.
+          schema:
+            type: string
+            enum: [fromDeparture, toDeparture, fromArrival, toArrival]
+      responses:
+        '200':
+          description: Nicht beobachtet (inferiert).
+          content:
+            application/json:
+              schema:
+                description: Unbekannt; vermutlich ein Objekt oder eine Zahl mit der Prozesszeit in Minuten.
+        '403':
+          $ref: '#/components/responses/WafRejected'
+        '404':
+          description: |
+            Keine Prozesszeit hinterlegt. Der Body ist **kein gültiges JSON** (unquotierter Klartext), obwohl
+            `Content-Type: application/json` gesendet wird. JSON-Parser schlagen hier fehl; Body als Text lesen.
+          content:
+            application/json:
+              schema:
+                type: string
+                description: Rohtext, nicht JSON-kodiert.
+              example: "Process time not found: 10409942, fromDeparture"
+
+  /flugdetailseite-75020:
+    get:
+      tags: [Zusatz]
+      operationId: getFlightDetailPage
+      summary: Flugdetailseite (vollständige HTML-Seite, keine API)
+      description: |
+        Ziel der Links in der Flugtafel. Enthält Airline, Flugnummer, Datum, Status, Terminal/Gate
+        (`h3.flight-box-area`, z. B. `T2 - Gate K08`), geplante/erwartete Zeiten, Codeshare-Nummern
+        und Flugzeugdaten (IATA/ICAO-Typ, Länge, Spannweite, MTOW).
+        **Nur mit `Accept: text/html`** kommt die Seite; mit `Accept: */*` liefert der Server ein 248 Byte großes
+        JavaScript-Snippet (Pagination-Callback einer anderen Komponente). Unbekannte IDs liefern trotzdem `200`.
+        Der englische Host hat eine eigene Seiten-ID; dieser Pfad gilt für munich-airport.de.
+      parameters:
+        - name: flight_id
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/FlightId'
+          example: "10409942.0"
+        - name: Accept
+          in: header
+          required: true
+          schema:
+            type: string
+            const: text/html
+      responses:
+        '200':
+          description: Vollständige HTML-Seite.
+          content:
+            text/html:
+              schema:
+                type: string
+        '403':
+          $ref: '#/components/responses/WafRejected'
+
+  /_b/0000000000000027589260bb6718b5d0/flugplan.pdf:
+    get:
+      tags: [Statisch]
+      operationId: getSeasonSchedulePdf
+      summary: Saison-Flugplan Winter 2026/2027 (PDF, 1,7 MB)
+      description: |
+        Statisches Dokument, verlinkt von der Flugsuche-Seite. Der Hash im Pfad ändert sich mit jeder neuen Ausgabe;
+        aktuellen Link aus `https://www.munich-airport.de/flugsuche-89523` (`href="…/flugplan.pdf"`) auslesen.
+        Inhalt: tabellarischer Linienflugplan je Zielort mit Spalten L/S (Landung/Start), Flug-Nr, Ziel ab, MUC,
+        Ziel an, Tag (Verkehrstage 1–7, `-` = kein Verkehr), Ziel (IATA), Stop, von, bis, Term., Airlinename.
+        Beobachtet: `Last-Modified: 23.10.2026`, Saison 25.10.2026–27.03.2027. Kein Fragment der AJAX-API.
+      responses:
+        '200':
+          description: PDF
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+
+components:
+  parameters:
+    page:
+      name: page
+      in: query
+      description: |
+        Seitenindex, 0-basiert. Im Board-Modus mit `allow_scroll_back=1` sind negative Werte erlaubt (frühere Flüge
+        vor `from`); ohne `allow_scroll_back` wird ein negativer Wert wie `0` behandelt. Nicht-numerisch → wie `0`.
+        Sehr große Werte liefern eine leere Tabelle mit `200`.
+      schema:
+        type: integer
+        default: 0
+      example: 0
+    per_page:
+      name: per_page
+      in: query
+      description: |
+        Flüge pro Seite. `0` oder nicht-numerisch → Server-Default 10. Die Website nutzt 6 (Flugsuche) bzw. 50 (Tafeln).
+        Keine feste Obergrenze gefunden: im Such-Modus lieferte `1000` alle 400 Tagesflüge; im Board-Modus über die
+        gesamte Zukunft lieferte `750` noch `200` (3,3 MB), `1000` aber `500`. `maximum: 750` ist daher eine
+        konservative Empfehlung, kein Serverlimit. Im Fragment erscheint jeder Flug doppelt
+        (Desktop- und Mobil-Tabelle), d. h. `2 × per_page` Zeilen `tr.fp-flight-item`.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 750
+        default: 10
+      example: 6
+    allow_pagination:
+      name: allow_pagination
+      in: query
+      description: Vom Client immer mit `1` gesendet. Im Test ohne messbaren Effekt auf Body oder Blätter-Buttons.
+      schema:
+        type: integer
+        enum: [0, 1]
+      example: 1
+    from:
+      name: from
+      in: query
+      description: |
+        Board-Modus. Lokale Zeit (Europe/Berlin) ohne Zeitzone, Format `YYYY-MM-DDTHH:MM:SS`. Liefert Flüge ab diesem
+        Zeitpunkt. Ohne `min_date`/`max_date` zählt `data-total-results` alle künftigen Flüge (z. B. 53526).
+        Ungültiger Wert → `500`.
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+      example: "2026-10-25T10:25:47"
+    allow_scroll_back:
+      name: allow_scroll_back
+      in: query
+      description: Board-Modus. `1` blendet den Button "Früher" ein und erlaubt negative `page`-Werte.
+      schema:
+        type: integer
+        enum: [0, 1]
+      example: 1
+    min_date:
+      name: min_date
+      in: query
+      description: Board-Modus. Untere Grenze des Zeitfensters (lokal, `YYYY-MM-DDTHH:MM:SS`); begrenzt auch `data-total-results`. Die Website sendet `heute − 1 Tag`. Ungültig → `500`.
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+      example: "2026-10-24T00:00:00"
+    max_date:
+      name: max_date
+      in: query
+      description: Board-Modus. Obere Grenze des Zeitfensters; die Website sendet `heute + 2 Tage`. Ungültig → `500`.
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+      example: "2026-10-27T00:00:00"
+    fsp_flight_from_muc:
+      name: flight_search_presenter[flight_from_muc]
+      in: query
+      description: Checkbox "Abflug ab München". Rails-Checkbox-Muster (`0` als Hidden-Feld, `1` als Checkbox, letzter Wert gewinnt). Serverseitig ohne Wirkung.
+      schema:
+        type: integer
+        enum: [0, 1]
+      example: 1
+    fsp_flight_date_from_muc:
+      name: flight_search_presenter[flight_date_from_muc]
+      in: query
+      description: |
+        Such-Modus, Abflüge. Datum `YYYY-MM-DD`. Fehlend oder unparsbar → heute. Vergangenheit → `200` mit 0 Treffern.
+        Datepicker erlaubt bis 2027-03-28; am Testtag lieferten alle Daten ab 2026-10-27 jedoch `500` (siehe Info).
+      schema:
+        type: string
+        format: date
+      example: "2026-10-25"
+    fsp_flight_time_from_muc:
+      name: flight_search_presenter[flight_time_from_muc]
+      in: query
+      description: |
+        Zeitfenster für Abflüge. Leer = ganzer Tag. `week` = ganze Woche um das Datum (Überschrift zeigt dann den
+        Startag, z. B. 22.10. für den 25.10.). Jedes Intervall `HH:MM-HH:MM` wird akzeptiert, nicht nur die vier
+        Vorgaben des Formulars (`05:00-08:59`, `09:00-14:59`, `15:00-19:59`, `20:00-23:59`). Unbekannter Wert → ignoriert.
+      schema:
+        type: string
+        pattern: '^(week|\d{2}:\d{2}-\d{2}:\d{2})?$'
+      examples:
+        ganzerTag: { value: "" }
+        vormittag: { value: "05:00-08:59" }
+        woche: { value: week }
+    fsp_flight_to_muc:
+      name: flight_search_presenter[flight_to_muc]
+      in: query
+      description: Checkbox "Ankunft in München". Serverseitig ohne Wirkung.
+      schema:
+        type: integer
+        enum: [0, 1]
+      example: 0
+    fsp_flight_date_to_muc:
+      name: flight_search_presenter[flight_date_to_muc]
+      in: query
+      description: Such-Modus, Ankünfte (nur von `/flightsearch/arrivals` ausgewertet). Semantik wie `flight_date_from_muc`.
+      schema:
+        type: string
+        format: date
+      example: "2026-10-25"
+    fsp_flight_time_to_muc:
+      name: flight_search_presenter[flight_time_to_muc]
+      in: query
+      description: Zeitfenster für Ankünfte (nur `/flightsearch/arrivals`). Semantik wie `flight_time_from_muc`.
+      schema:
+        type: string
+        pattern: '^(week|\d{2}:\d{2}-\d{2}:\d{2})?$'
+      example: ""
+    fsp_airport:
+      name: flight_search_presenter[airport]
+      in: query
+      description: Anzeigetext aus dem Autocomplete (`display_human`). Serverseitig **ignoriert**; gefiltert wird nur über `airport_id`.
+      schema:
+        type: string
+      example: "Rom, Italien (FCO)"
+    fsp_airport_id:
+      name: flight_search_presenter[airport_id]
+      in: query
+      description: |
+        Flughafen-ID aus `/flightsearch/autocomplete_airport`. Kommagetrennte Liste (Ländergruppe) möglich,
+        z. B. `144,387,44188,661`. Unbekannt/nicht numerisch → `200` mit 0 Treffern.
+      schema:
+        type: string
+        pattern: '^\d+(,\d+)*$'
+      examples:
+        fco: { value: "1117" }
+        rumaenien: { value: "144,387,44188,661" }
+    fsp_airline:
+      name: flight_search_presenter[airline]
+      in: query
+      description: Anzeigetext aus dem Autocomplete. Serverseitig **ignoriert**; gefiltert wird nur über `airline_id`.
+      schema:
+        type: string
+      example: "Lufthansa (LH, DLH)"
+    fsp_airline_id:
+      name: flight_search_presenter[airline_id]
+      in: query
+      description: Airline-ID aus `/flightsearch/autocomplete_airline` (z. B. 52 = Lufthansa).
+      schema:
+        type: integer
+        minimum: 1
+      example: 52
+    fsp_flight_number:
+      name: flight_search_presenter[flight_number]
+      in: query
+      description: |
+        Flugnummer, tolerant: `LH1842`, `lh 1842` und `1842` treffen denselben Flug; Codeshare-Nummern (`UA9324`)
+        finden den operierenden Flug (`LH 1842`), der Codeshare wird dann zusätzlich in der Zeile ausgegeben.
+        Unbekannte Werte wie `739A` → 0 Treffer bzw. Kombination mit anderen Filtern.
+      schema:
+        type: string
+      example: "LH1842"
+    fsp_locale:
+      name: flight_search_presenter[locale]
+      in: query
+      description: Vom Formular gesendet (`de`/`en`), serverseitig **ignoriert** – die Sprache kommt aus der Session (siehe Info).
+      schema:
+        type: string
+        enum: [de, en]
+      example: de
+    fsp_perform_search:
+      name: flight_search_presenter[perform_search]
+      in: query
+      description: Nur im versteckten Formular der Ergebnisseite (`/suchergebnisseite-flugsuche-75086`) gesetzt. Ohne beobachtete Wirkung auf die Fragmente.
+      schema:
+        type: integer
+        enum: [1]
+    utf8:
+      name: utf8
+      in: query
+      description: Rails-Formularmarker (`✓`), optional.
+      schema:
+        type: string
+      example: "✓"
+    cacheBuster:
+      name: _
+      in: query
+      description: jQuery-Cache-Buster (Zeitstempel in ms), optional und ohne Wirkung.
+      schema:
+        type: integer
+      example: 1792920641944
+    search_term:
+      name: search_term
+      in: query
+      required: false
+      description: Suchbegriff (Teilstring, case-insensitiv). Leer/fehlend → `[]`.
+      schema:
+        type: string
+      example: Rom
+
+  responses:
+    FlightBoardFragment:
+      description: |
+        HTML-Fragment der Flugtafel (`Content-Type: text/html; charset=utf-8`, `Cache-Control: no-cache`).
+        Struktur siehe `x-htmlFragments.flightBoard`. Bei 0 Treffern enthält `div.fp-flight-board-body`
+        nur `div.fp-flights-not-found` mit `<p>Es konnten leider keine Flüge gefunden werden.</p>`.
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            abflug:
+              summary: Gekürztes Fragment für genau einen Treffer (Flugnummer LH1842)
+              value: |
+                <header class="fp-flight-board-header">
+                  <h3 class="fp-flights-headline">Flüge von München am 25.10.2026</h3>
+                  <div class="fp-flights-show-other">
+                    <button class="fp-flights-prev btn-link" style="visibility: hidden;">…Früher</button>
+                  </div>
+                </header>
+                <div class="fp-flight-board-body" data-total-results="1">
+                  <table class="fp-flights-table fp-flights-table-large">
+                    <thead><tr>
+                      <th class="fp-flight-airline">Airline</th><th class="fp-flight-airport">Nach</th>
+                      <th class="fp-flight-number">Flugnr. (Typ)</th><th class="fp-flight-status">Status</th>
+                      <th class="fp-flight-time-muc">MUC ab<br/>Geplant | Erwartet</th><th class="fp-flight-time-other">Ankunft</th>
+                      <th class="fp-flight-area">Bereich</th><th class="fp-flight-tracking">Flug merken</th><th class="fp-flight-booking">Flug buchen</th>
+                    </tr></thead>
+                    <tbody>
+                      <tr data-flight-id="10409942.0" class="fp-flight-item">
+                        <td class="fp-flight-airline"><div class="svg-container js-tooltip-context">
+                          <a class="js-tooltip-hover-trigger" href="/flugdetailseite-75020?flight_id=10409942.0">
+                            <div class="spacer-2-1" aria-label="Lufthansa"></div>
+                            <img src="/cache/passngr/?path=images%2FbigIcon%2Flow%2F164932.gif" class="logo-airline" /></a>
+                          <div class="info-container js-tooltip sr-only bg-bright hidden-xs"><div class="info-content">Lufthansa</div></div></div></td>
+                        <td class="fp-flight-airport"><a href="/flugdetailseite-75020?flight_id=10409942.0">Valencia (VLC)</a></td>
+                        <td class="fp-flight-number"><a href="/flugdetailseite-75020?flight_id=10409942.0"><span class="nobr">LH 1842 (A20N)</span></a></td>
+                        <td class="fp-flight-status">geplant</td>
+                        <td class="fp-flight-time-muc">15:10&nbsp;|&nbsp;</td>
+                        <td class="fp-flight-time-other">17:35</td>
+                        <td class="fp-flight-area"><span class="nobr">T2</span></td>
+                        <td class="fp-flight-tracking"><div class="switch-toggle">…<input type="checkbox" value="1" id="tracker-f82f0465cfeb" data-flight-id="10409942.0" class="switch-toggle-input js-switch-toggle-input">…</div></td>
+                        <td class="fp-flight-booking"><span class="fp-flight-booking__link disabled" title="Flüge können nur 48 Stunden im Voraus gebucht werden.">…</span></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <table class="fp-flights-table fp-flights-table-small"><tbody>
+                    <tr data-flight-id="10409942.0" class="fp-flight-item"> … (derselbe Flug in Mobil-Darstellung) … </tr>
+                  </tbody></table>
+                </div>
+                <footer id="fp-flights-footer" class="fp-flight-board-footer">
+                  <div class="fp-flights-show-other"><button class="fp-flights-next btn-link">…Später</button></div>
+                </footer>
+            keineTreffer:
+              summary: Keine Treffer
+              value: |
+                <header class="fp-flight-board-header">
+                  <h3 class="fp-flights-headline">Flüge von München am 01.01.2020</h3>
+                  <div class="fp-flights-show-other"><button class="fp-flights-prev btn-link" style="visibility: hidden;">…Früher</button></div>
+                </header>
+                <div class="fp-flight-board-body" data-total-results="0">
+                  <div class="fp-flights-not-found"><p>Es konnten leider keine Flüge gefunden werden.</p></div>
+                </div>
+    ServerErrorPage:
+      description: Generische Rails-Fehlerseite ("We're sorry, but something went wrong (500)"), 1549 Byte, `text/html`.
+      content:
+        text/html:
+          schema:
+            type: string
+    WafRejected:
+      description: |
+        Von der vorgeschalteten Web Application Firewall blockiert (statische HTML-Seite "Request Rejected" /
+        "Anfrage blockiert"). Tritt bei Steuer-/Sonderzeichen in Query-Namen oder -Werten, extremen Zahlen,
+        unsinnigen Datumsangaben und bei nicht erlaubten HTTP-Methoden (`POST`, `TRACE`) auf.
+      content:
+        text/html:
+          schema:
+            type: string
+          example: |
+            <html><head><title>Request Rejected</title></head><body>
+            <h2>Request Rejected</h2>The requested URL was rejected.<br><br>
+            <h2>Anfrage blockiert</h2>Die angeforderte URL wurde blockiert.
+            </body></html>
+
+  schemas:
+    FlightId:
+      type: string
+      description: Interne Flug-ID. Die Website verwendet die Schreibweise mit `.0`-Suffix; die Endpunkte akzeptieren beides.
+      pattern: '^\d+(\.0)?$'
+      examples: ["10409942.0", "10409942"]
+    AirportSuggestion:
+      type: object
+      required: [id, display_human, type, type_human]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Flughafen-ID oder kommagetrennte Gruppe (Land = alle Flughäfen). Direkt als `flight_search_presenter[airport_id]` verwendbar.
+          pattern: '^\d+(,\d+)*$'
+        display_human:
+          type: string
+          description: Anzeigetext, lokalisiert, Muster `Stadt, Land (IATA)` bzw. `Land, Alle Flughäfen`.
+        type:
+          type: string
+          const: airport
+        type_human:
+          type: string
+          description: Lokalisierte Gruppenüberschrift (`Flüge von/nach:` bzw. `Flights from/to:`).
+    AirlineSuggestion:
+      type: object
+      required: [id, display_human, type, type_human]
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          description: Airline-ID, direkt als `flight_search_presenter[airline_id]` verwendbar.
+        display_human:
+          type: string
+          description: Muster `Name (IATA, ICAO)`; fehlender IATA-Code erscheint als `--`.
+        type:
+          type: string
+          const: airline
+        type_human:
+          type: string
+          description: Lokalisiert (`Flüge mit` bzw. `Flights with`).
+    FlightRow:
+      type: object
+      description: |
+        **Kein Wire-Format.** Hilfsschema für Parser: so lässt sich eine Zeile `tr.fp-flight-item` der großen Tabelle abbilden.
+        Selektoren siehe `x-htmlFragments.flightBoard.row`.
+      properties:
+        flightId: { $ref: '#/components/schemas/FlightId' }
+        airline: { type: string, description: 'Aus `div.spacer-2-1[aria-label]` bzw. `.info-content`', examples: [Lufthansa] }
+        airlineLogo: { type: string, description: 'Relativer Pfad `img.logo-airline[src]`', examples: ['/cache/passngr/?path=images%2FbigIcon%2Flow%2F164932.gif'] }
+        airport: { type: string, description: 'Ziel (Abflug) bzw. Herkunft (Ankunft), `Stadt (IATA)`', examples: ['Valencia (VLC)', 'Kreta / Chania (CHQ)'] }
+        flightNumber: { type: string, description: 'Operierende Flugnummer; Codeshares als weitere `span.nobr` in derselben Zelle', examples: ['LH 1842'] }
+        aircraftType: { type: string, description: 'ICAO-Typ in Klammern hinter der Flugnummer', examples: [A20N, A320, A21N] }
+        status:
+          type: string
+          description: Lokalisierter Statustext. Beobachtete deutsche Werte, nicht abschließend.
+          examples: [geplant, Check-In, boarding, gestartet, gelandet]
+        scheduledMuc: { type: string, description: 'Teil vor `|` in `td.fp-flight-time-muc`, Format HH:MM lokal', examples: ['15:10'] }
+        expectedMuc: { type: string, description: 'Teil nach `|`, leer wenn keine Abweichung/Erwartung', examples: ['', '06:25'] }
+        timeOther: { type: string, description: 'Ankunft am Ziel (Abflüge) bzw. Abflug am Startort (Ankünfte), Ortszeit', examples: ['17:35'] }
+        area: { type: string, description: 'Terminal/Bereich', examples: [T1A, T1B, T1C, T1D, T2] }
+        bookingUrl: { type: [string, 'null'], description: 'Buchungslink, sonst `null` (Span `disabled`, Buchung nur ≥ 48 h im Voraus)' }
+
+  x-htmlFragments:
+    flightBoard:
+      root: "header.fp-flight-board-header + div.fp-flight-board-body + footer#fp-flights-footer"
+      headline: "h3.fp-flights-headline — z. B. 'Flüge von München am 25.10.2026' / 'Flights from Munich on 25.10.2026'"
+      totalResults: "div.fp-flight-board-body[data-total-results] — Gesamtzahl Treffer über alle Seiten (int)"
+      prevButton: "button.fp-flights-prev — style='visibility: hidden' wenn kein Zurückblättern möglich"
+      nextButton: "button.fp-flights-next im Footer — fehlt, wenn keine weitere Seite"
+      tables:
+        large: "table.fp-flights-table-large — Desktop, eine Zeile je Flug"
+        small: "table.fp-flights-table-small — Mobil, derselbe Flug noch einmal (time-table mit Status/Geplant/Erwartet/Ankunft|Abflug/Bereich)"
+      row:
+        selector: "table.fp-flights-table-large tr.fp-flight-item"
+        flightId: "@data-flight-id"
+        airline: "td.fp-flight-airline div.spacer-2-1/@aria-label"
+        airlineLogo: "td.fp-flight-airline img.logo-airline/@src"
+        airport: "td.fp-flight-airport a (Text)"
+        flightNumberAndType: "td.fp-flight-number span.nobr (Text, 'LH 1842 (A20N)'; weitere span.nobr = Codeshares)"
+        status: "td.fp-flight-status (Text)"
+        timeMuc: "td.fp-flight-time-muc (Text 'HH:MM&nbsp;|&nbsp;HH:MM' → geplant | erwartet)"
+        timeOther: "td.fp-flight-time-other (Text)"
+        area: "td.fp-flight-area span.nobr (Text)"
+        detailUrl: "td.fp-flight-airport a/@href → /flugdetailseite-75020?flight_id=…"
+        booking: "td.fp-flight-booking a.fp-flight-booking__link/@href oder span.fp-flight-booking__link.disabled[title]"
+      notFound: "div.fp-flights-not-found p — 'Es konnten leider keine Flüge gefunden werden.'"
